@@ -198,11 +198,18 @@ def query_pixel(pixel, nside, band, config, cache_dir):
 
     query = build_pixel_query(pixel, nside, band, config)
 
-    try:
-        result = qc.query(sql=query, fmt="pandas", timeout=600)
-    except Exception as exc:
-        print(f"  Query failed for pixel {pixel}: {exc}", flush=True)
-        return None
+    for attempt in range(3):
+        try:
+            result = qc.query(sql=query, fmt="pandas", timeout=600)
+            break
+        except Exception as exc:
+            print(f"  Query failed for pixel {pixel} (attempt {attempt+1}/3): {exc}",
+                  flush=True)
+            if attempt < 2:
+                import time as _time
+                _time.sleep(10 * (attempt + 1))  # 10s, 20s backoff
+            else:
+                return "FAILED"  # sentinel: do NOT cache as empty
 
     if result is None or len(result) == 0:
         # Write empty parquet so we don't re-query
@@ -366,7 +373,83 @@ EMPTY_COLS = [
 ]
 
 
-def ingest_band(band, pixels, config, output_dir, cache_dir):
+def _process_single_pixel(pixel, nside, band, config, chip_df, exposure_df,
+                           band_output_dir, band_cache_dir, cuts):
+    """Process a single pixel: query, join, cap, filter, save.
+
+    Returns (pixel, n_stars, n_dets, expnums, ccd_exposures, elapsed).
+    Thread-safe: each pixel writes to its own file.
+    """
+    t0 = time.time()
+    out_file = band_output_dir / f"detections_nside{nside}_pixel{pixel}.parquet"
+
+    # Check if output already exists
+    if out_file.exists():
+        df_out = pd.read_parquet(out_file)
+        if len(df_out) > 0:
+            uniq = df_out[["expnum", "ccdnum"]].drop_duplicates()
+            return (
+                pixel, df_out["objectid"].nunique(), len(df_out),
+                set(uniq["expnum"].values),
+                set(zip(uniq["expnum"].values, uniq["ccdnum"].values)),
+                time.time() - t0, "cached",
+            )
+        # Empty output file: check if raw cache exists to distinguish
+        # genuinely empty pixels from previous timeout failures
+        raw_cache = band_cache_dir / f"raw_{band}_nside{nside}_pixel{pixel}.parquet"
+        if raw_cache.exists():
+            return (pixel, 0, 0, set(), set(), time.time() - t0, "cached_empty")
+        # No raw cache = previous timeout failure. Delete empty output and re-query.
+        out_file.unlink()
+        print(f"  Pixel {pixel}: re-querying (previous timeout)", flush=True)
+
+    # Query Data Lab
+    df = query_pixel(pixel, nside, band, config, band_cache_dir)
+
+    # "FAILED" sentinel means query timed out — do NOT write empty output
+    if df == "FAILED":
+        return (pixel, 0, 0, set(), set(), time.time() - t0, "failed")
+
+    if df is None or len(df) == 0:
+        pd.DataFrame(columns=EMPTY_COLS).to_parquet(out_file, index=False)
+        return (pixel, 0, 0, set(), set(), time.time() - t0, "empty")
+
+    # Apply local joins
+    df = apply_local_joins(df, chip_df, exposure_df, band, config)
+    if len(df) == 0:
+        pd.DataFrame(columns=EMPTY_COLS).to_parquet(out_file, index=False)
+        return (pixel, 0, 0, set(), set(), time.time() - t0, "empty")
+
+    # Re-assign to correct HEALPix pixel
+    df = assign_to_healpix_pixel(df, nside)
+    df = df[df["healpix_pixel"] == pixel].drop(columns=["healpix_pixel"])
+    if len(df) == 0:
+        pd.DataFrame(columns=EMPTY_COLS).to_parquet(out_file, index=False)
+        return (pixel, 0, 0, set(), set(), time.time() - t0, "empty")
+
+    # Apply detection cap (use pixel as seed for reproducibility)
+    rng = np.random.default_rng(42 + pixel)
+    df = apply_detection_cap(df, cuts["max_detections_per_star"], rng=rng)
+
+    # Filter minimum detections
+    df = filter_min_detections(df, cuts["min_detections_per_star"])
+    if len(df) == 0:
+        pd.DataFrame(columns=EMPTY_COLS).to_parquet(out_file, index=False)
+        return (pixel, 0, 0, set(), set(), time.time() - t0, "empty")
+
+    df.to_parquet(out_file, index=False)
+    n_stars = df["objectid"].nunique()
+    n_dets = len(df)
+    uniq = df[["expnum", "ccdnum"]].drop_duplicates()
+    return (
+        pixel, n_stars, n_dets,
+        set(uniq["expnum"].values),
+        set(zip(uniq["expnum"].values, uniq["ccdnum"].values)),
+        time.time() - t0, "queried",
+    )
+
+
+def ingest_band(band, pixels, config, output_dir, cache_dir, n_workers=1):
     """Run Phase 0 ingestion for one band across the given HEALPix pixels.
 
     Parameters
@@ -381,12 +464,16 @@ def ingest_band(band, pixels, config, output_dir, cache_dir):
         Directory for final output parquet files.
     cache_dir : Path
         Directory for cached query results.
+    n_workers : int
+        Number of parallel query workers (default 1 = sequential).
 
     Returns
     -------
     stats : dict
         Summary statistics.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     nside = config["survey"]["nside_chunk"]
     cuts = config["quality_cuts"]
 
@@ -403,101 +490,133 @@ def ingest_band(band, pixels, config, output_dir, cache_dir):
     total_detections = 0
     total_exposures = set()
     total_ccd_exposures = set()
-    rng = np.random.default_rng(42)
 
     n_pixels = len(pixels)
     t0 = time.time()
+    completed = 0
 
-    for i, pixel in enumerate(pixels):
-        t_pixel = time.time()
+    if n_workers <= 1:
+        # Sequential mode (original behavior)
+        for i, pixel in enumerate(pixels):
+            result = _process_single_pixel(
+                pixel, nside, band, config, chip_df, exposure_df,
+                band_output_dir, band_cache_dir, cuts,
+            )
+            pix, n_s, n_d, exps, ccd_exps, dt, status = result
+            total_stars += n_s
+            total_detections += n_d
+            total_exposures.update(exps)
+            total_ccd_exposures.update(ccd_exps)
+            completed += 1
 
-        # Check if output already exists
-        out_file = band_output_dir / f"detections_nside{nside}_pixel{pixel}.parquet"
-        if out_file.exists():
-            # Read cached output to accumulate stats
-            df_out = pd.read_parquet(out_file)
-            if len(df_out) > 0:
-                total_stars += df_out["objectid"].nunique()
-                total_detections += len(df_out)
-                uniq = df_out[["expnum", "ccdnum"]].drop_duplicates()
-                total_exposures.update(uniq["expnum"].values)
-                total_ccd_exposures.update(
-                    zip(uniq["expnum"].values, uniq["ccdnum"].values)
+            elapsed = time.time() - t0
+            rate = completed / elapsed if elapsed > 0 else 0
+            eta = (n_pixels - completed) / rate if rate > 0 else 0
+
+            if status == "queried":
+                print(
+                    f"  [{completed}/{n_pixels}] Pixel {pix}: "
+                    f"{n_s} stars, {n_d} dets, {dt:.1f}s, ETA {eta:.0f}s",
+                    flush=True,
                 )
-            elapsed = time.time() - t0
-            rate = (i + 1) / elapsed if elapsed > 0 else 0
-            eta = (n_pixels - i - 1) / rate if rate > 0 else 0
-            print(
-                f"  [{i+1}/{n_pixels}] Pixel {pixel}: cached ({len(df_out)} dets), "
-                f"ETA {eta:.0f}s",
-                flush=True,
-            )
-            continue
+            elif status in ("cached", "cached_empty"):
+                if completed % 100 == 0 or completed == n_pixels:
+                    print(
+                        f"  [{completed}/{n_pixels}] Pixel {pix}: {status} "
+                        f"({n_d} dets), ETA {eta:.0f}s",
+                        flush=True,
+                    )
+            else:
+                if completed % 50 == 0:
+                    print(
+                        f"  [{completed}/{n_pixels}] Pixel {pix}: no data, "
+                        f"ETA {eta:.0f}s",
+                        flush=True,
+                    )
+    else:
+        # Parallel mode — process in batches to avoid overwhelming Data Lab
+        batch_size = n_workers * 4  # 4 batches worth of work per round
+        print(f"  Using {n_workers} parallel workers, batch size {batch_size}",
+              flush=True)
+        failed_pixels = []
 
-        # Query Data Lab (meas table only, no joins)
-        df = query_pixel(pixel, nside, band, config, band_cache_dir)
+        for batch_start in range(0, n_pixels, batch_size):
+            batch = pixels[batch_start:batch_start + batch_size]
 
-        if df is None or len(df) == 0:
-            pd.DataFrame(columns=EMPTY_COLS).to_parquet(out_file, index=False)
-            elapsed = time.time() - t0
-            rate = (i + 1) / elapsed if elapsed > 0 else 0
-            eta = (n_pixels - i - 1) / rate if rate > 0 else 0
-            print(
-                f"  [{i+1}/{n_pixels}] Pixel {pixel}: no data, "
-                f"ETA {eta:.0f}s",
-                flush=True,
-            )
-            continue
+            with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                futures = {}
+                for pixel in batch:
+                    fut = executor.submit(
+                        _process_single_pixel,
+                        pixel, nside, band, config, chip_df, exposure_df,
+                        band_output_dir, band_cache_dir, cuts,
+                    )
+                    futures[fut] = pixel
 
-        # Apply local joins (chip zpterm, exposure instrument filter)
-        df = apply_local_joins(df, chip_df, exposure_df, band, config)
+                for fut in as_completed(futures):
+                    try:
+                        result = fut.result()
+                    except Exception as exc:
+                        pixel = futures[fut]
+                        print(f"  Pixel {pixel} failed: {exc}", flush=True)
+                        failed_pixels.append(pixel)
+                        completed += 1
+                        continue
 
-        if len(df) == 0:
-            pd.DataFrame(columns=EMPTY_COLS).to_parquet(out_file, index=False)
-            continue
+                    pix, n_s, n_d, exps, ccd_exps, dt, status = result
+                    total_stars += n_s
+                    total_detections += n_d
+                    total_exposures.update(exps)
+                    total_ccd_exposures.update(ccd_exps)
+                    completed += 1
 
-        # Re-assign to correct HEALPix pixel (filter out margin detections)
-        df = assign_to_healpix_pixel(df, nside)
-        df = df[df["healpix_pixel"] == pixel].drop(columns=["healpix_pixel"])
+                    if status == "failed":
+                        failed_pixels.append(pix)
 
-        if len(df) == 0:
-            pd.DataFrame(columns=EMPTY_COLS).to_parquet(out_file, index=False)
-            continue
+                    elapsed = time.time() - t0
+                    rate = completed / elapsed if elapsed > 0 else 0
+                    eta = (n_pixels - completed) / rate if rate > 0 else 0
 
-        # Apply detection cap
-        df = apply_detection_cap(df, cuts["max_detections_per_star"], rng=rng)
+                    if status == "queried" and n_d > 0:
+                        print(
+                            f"  [{completed}/{n_pixels}] Pixel {pix}: "
+                            f"{n_s} stars, {n_d} dets, {dt:.1f}s, ETA {eta:.0f}s",
+                            flush=True,
+                        )
+                    elif status == "failed":
+                        print(
+                            f"  [{completed}/{n_pixels}] Pixel {pix}: FAILED "
+                            f"(will retry), ETA {eta:.0f}s",
+                            flush=True,
+                        )
+                    elif completed % 200 == 0 or completed == n_pixels:
+                        print(
+                            f"  [{completed}/{n_pixels}] Progress: {status}, "
+                            f"ETA {eta:.0f}s",
+                            flush=True,
+                        )
 
-        # Filter minimum detections
-        df = filter_min_detections(df, cuts["min_detections_per_star"])
-
-        if len(df) == 0:
-            pd.DataFrame(columns=EMPTY_COLS).to_parquet(out_file, index=False)
-            continue
-
-        # Write output
-        df.to_parquet(out_file, index=False)
-
-        n_stars = df["objectid"].nunique()
-        n_dets = len(df)
-        total_stars += n_stars
-        total_detections += n_dets
-        uniq = df[["expnum", "ccdnum"]].drop_duplicates()
-        total_exposures.update(uniq["expnum"].values)
-        total_ccd_exposures.update(
-            zip(uniq["expnum"].values, uniq["ccdnum"].values)
-        )
-
-        elapsed = time.time() - t0
-        rate = (i + 1) / elapsed if elapsed > 0 else 0
-        eta = (n_pixels - i - 1) / rate if rate > 0 else 0
-        dt = time.time() - t_pixel
-
-        print(
-            f"  [{i+1}/{n_pixels}] Pixel {pixel}: "
-            f"{n_stars} stars, {n_dets} dets, {dt:.1f}s, "
-            f"ETA {eta:.0f}s",
-            flush=True,
-        )
+        # Retry failed pixels sequentially
+        if failed_pixels:
+            print(f"\n  Retrying {len(failed_pixels)} failed pixels sequentially...",
+                  flush=True)
+            for pixel in failed_pixels:
+                result = _process_single_pixel(
+                    pixel, nside, band, config, chip_df, exposure_df,
+                    band_output_dir, band_cache_dir, cuts,
+                )
+                pix, n_s, n_d, exps, ccd_exps, dt, status = result
+                total_stars += n_s
+                total_detections += n_d
+                total_exposures.update(exps)
+                total_ccd_exposures.update(ccd_exps)
+                if status == "failed":
+                    print(f"  Pixel {pix}: still failing after retry", flush=True)
+                elif n_d > 0:
+                    print(f"  Pixel {pix}: recovered {n_s} stars, {n_d} dets",
+                          flush=True)
+            print(f"  Retry complete. {len(failed_pixels)} pixels attempted.",
+                  flush=True)
 
     total_time = time.time() - t0
 
@@ -527,6 +646,14 @@ def main():
         "--max-pixels", type=int, default=None,
         help="Limit to first N pixels (for quick testing)"
     )
+    parser.add_argument(
+        "--parallel", type=int, default=1,
+        help="Number of parallel query workers (default 1 = sequential)"
+    )
+    parser.add_argument(
+        "--dec-max", type=float, default=35.0,
+        help="Maximum declination for DELVE footprint (default 35 deg)"
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -543,7 +670,16 @@ def main():
         print(f"Test region: {len(pixels)} HEALPix pixels (nside={nside})", flush=True)
     else:
         pixels = get_all_healpix_pixels(nside)
-        print(f"Full sky: {len(pixels)} HEALPix pixels (nside={nside})", flush=True)
+        n_all = len(pixels)
+
+        # Filter to DELVE footprint (dec < dec_max)
+        import healpy as hp
+        theta, phi = hp.pix2ang(nside, pixels, nest=False)
+        dec = 90.0 - np.degrees(theta)
+        mask = dec < args.dec_max
+        pixels = pixels[mask]
+        print(f"Full sky: {n_all} -> {len(pixels)} pixels after dec < {args.dec_max} "
+              f"(nside={nside})", flush=True)
 
     if args.max_pixels is not None:
         pixels = pixels[:args.max_pixels]
@@ -552,6 +688,8 @@ def main():
     print(f"Band: {args.band}", flush=True)
     print(f"Output: {output_dir}", flush=True)
     print(f"Cache: {cache_dir}", flush=True)
+    if args.parallel > 1:
+        print(f"Parallel workers: {args.parallel}", flush=True)
     print(flush=True)
 
     # Download DES FGCM zero-points
@@ -559,7 +697,8 @@ def main():
     print(flush=True)
 
     # Run ingestion
-    stats = ingest_band(args.band, pixels, config, output_dir, cache_dir)
+    stats = ingest_band(args.band, pixels, config, output_dir, cache_dir,
+                        n_workers=args.parallel)
 
     # Print summary
     print(flush=True)
