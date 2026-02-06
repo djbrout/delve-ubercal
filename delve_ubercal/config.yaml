@@ -1,0 +1,56 @@
+# delve_ubercal config
+survey:
+  bands: [g, r, i, z]
+  nside_chunk: 32          # HEALPix nside for data chunking (~3 deg² pixels)
+
+data:
+  source: astro_data_lab                         # All data from NOIRLab Astro Data Lab
+  meas_table: nsc_dr2.meas                       # Single-epoch detections
+  chip_table: nsc_dr2.chip                       # Per-CCD metadata + zpterm
+  exposure_table: nsc_dr2.exposure               # Per-exposure metadata (instrument, expnum)
+  des_fgcm_table: des_dr2.y6_gold_zeropoint      # DES FGCM zero-points (anchor)
+  delve_objects_table: delve_dr2.objects          # DELVE DR2 coadded objects (optional: for spread_model star selection)
+  nsc_delve_xmatch: nsc_dr2.x1p5__object__delve_dr2__objects  # NSC-DELVE cross-match
+  output_path: /Volumes/External5TB/DELVE_UBERCAL/output/
+  cache_path: /Volumes/External5TB/DELVE_UBERCAL/cache/       # Local parquet cache of query results
+
+quality_cuts:
+  mag_min: 17.0                # mag_auto from nsc_dr2.meas
+  mag_max: 20.0
+  magerr_max: 0.05             # magerr_auto from nsc_dr2.meas
+  flags_max: 0                 # NSC flags (0 = clean)
+  class_star_min: 0.8          # SExtractor CLASS_STAR from nsc_dr2.meas (no spread_model available)
+  min_detections_per_star: 2
+  max_detections_per_star: 25  # Random subsample if exceeded
+  exclude_ccdnums: [61]        # N30: dead since Nov 2012
+  instrument: c4d              # DECam only (filter out Mosaic, NEWFIRM, etc.)
+
+solve:
+  method: cg                # Conjugate gradient on normal equations
+  max_iterations: 5000
+  tolerance: 1.0e-5         # Relative residual
+  des_anchor_weight: 1.0e6  # Penalty weight for DES ZP anchoring (anchored mode)
+  tikhonov_reg: 1.0e-10     # Diagonal regularization (unanchored mode)
+
+outlier_rejection:
+  n_iterations: 5
+  star_chi2_cut: 3.0        # chi2/dof threshold for star rejection
+  detection_sigma_cut: 5.0  # Individual detection outlier threshold
+  exposure_zp_cut: 0.3      # Max deviation from nightly median ZP (mag)
+
+starflat:
+  enabled: true
+  polynomial_order: 3       # Per-CCD 2D Chebyshev order
+  min_stars_per_bin: 50
+  # Hardware-driven epoch boundaries (MJD)
+  epoch_boundaries:
+    global:                  # Apply to all CCDs
+      - 56404              # 2013 Apr 22: g-band baffling
+      - 56516              # 2013 Aug 12: rizY baffling
+      - 56730              # 2014 Mar 14: shutter/filter aerosolization
+    per_ccd:
+      2:                   # S30
+        - 56626            # 2013 Nov 30: failure
+        - 57751            # 2016 Dec 29: recovery
+      41:                  # N10
+        - 58350            # 2018 Sep: hardware intervention

@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Data files
+*.fits
+*.fits.gz
+*.parquet
+*.hdf5
+*.h5
+*.csv.gz
+
+# Output directories
+output/
+cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+._*
+Thumbs.db
+
+# Virtual environments
+venv/
+.env/
+
+# Ralph loop state
+.claude/
