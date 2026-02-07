@@ -407,7 +407,7 @@ def _process_single_pixel(pixel, nside, band, config, chip_df, exposure_df,
     df = query_pixel(pixel, nside, band, config, band_cache_dir)
 
     # "FAILED" sentinel means query timed out — do NOT write empty output
-    if df == "FAILED":
+    if isinstance(df, str) and df == "FAILED":
         return (pixel, 0, 0, set(), set(), time.time() - t0, "failed")
 
     if df is None or len(df) == 0:
