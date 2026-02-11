@@ -66,7 +66,7 @@ class TestCatalogOutput:
         """Catalog should have expected columns."""
         expected = [
             "objectid", "ra", "dec",
-            "mag_ubercal_g", "magerr_ubercal_g",
+            "mag_ubercal_g", "mag_before_g", "magerr_ubercal_g",
             "nobs_g", "chi2_g",
         ]
         # Just verify the expected column names are strings

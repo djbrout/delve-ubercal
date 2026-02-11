@@ -7,3 +7,6 @@ astro-datalab>=2.20
 pyarrow>=12.0
 matplotlib>=3.7
 pyyaml>=6.0
+pyvo>=1.4
+dustmaps>=1.0
+pandas>=2.0

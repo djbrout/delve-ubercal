@@ -41,6 +41,11 @@ def get_test_region_pixels(nside):
     return get_healpix_pixels_in_region(nside, 50.0, 70.0, -40.0, -25.0)
 
 
+def get_test_patch_pixels(nside):
+    """Get HEALPix pixels for the 10x10 deg test patch: RA=50-60, Dec=-35 to -25."""
+    return get_healpix_pixels_in_region(nside, 50.0, 60.0, -35.0, -25.0)
+
+
 def _pixel_coord_box(pixel, nside):
     """Get RA/Dec coordinate box for a HEALPix pixel with margin."""
     import healpy as hp
@@ -95,18 +100,35 @@ def build_pixel_query(pixel, nside, band, config):
         m.ccdnum,
         m.mag_auto,
         m.magerr_auto,
+        m.mag_aper1,
+        m.magerr_aper1,
+        m.mag_aper2,
+        m.magerr_aper2,
+        m.mag_aper4,
+        m.magerr_aper4,
+        m.mag_aper8,
+        m.magerr_aper8,
+        m.kron_radius,
+        m.fwhm,
+        m.class_star,
+        m.flags,
+        m.asemi,
+        m.bsemi,
+        m.theta,
         m.mjd,
         m.ra,
         m.dec,
+        m.raerr,
+        m.decerr,
         m.x,
         m.y
     FROM {tables['meas_table']} m
     WHERE m.filter = '{band}'
       AND m.flags <= {cuts['flags_max']}
       AND m.class_star > {cuts['class_star_min']}
-      AND m.magerr_auto < {cuts['magerr_max']}
-      AND m.mag_auto > {cuts['mag_min']}
-      AND m.mag_auto < {cuts['mag_max']}
+      AND m.magerr_aper4 < {cuts['magerr_max']}
+      AND m.mag_aper4 > {cuts['mag_min']}
+      AND m.mag_aper4 < {cuts['mag_max']}
       AND m.ccdnum NOT IN ({','.join(str(c) for c in cuts['exclude_ccdnums'])})
       AND m.ra BETWEEN {ra_min:.6f} AND {ra_max:.6f}
       AND m.dec BETWEEN {dec_min:.6f} AND {dec_max:.6f}
@@ -200,7 +222,7 @@ def query_pixel(pixel, nside, band, config, cache_dir):
 
     for attempt in range(3):
         try:
-            result = qc.query(sql=query, fmt="pandas", timeout=600)
+            result = qc.query(sql=query, fmt="pandas", timeout=2400)
             break
         except Exception as exc:
             print(f"  Query failed for pixel {pixel} (attempt {attempt+1}/3): {exc}",
@@ -216,7 +238,14 @@ def query_pixel(pixel, nside, band, config, cache_dir):
         empty = pd.DataFrame(
             columns=[
                 "objectid", "exposure", "ccdnum",
-                "mag_auto", "magerr_auto", "mjd", "ra", "dec", "x", "y",
+                "mag_auto", "magerr_auto",
+                "mag_aper1", "magerr_aper1",
+                "mag_aper2", "magerr_aper2",
+                "mag_aper4", "magerr_aper4",
+                "mag_aper8", "magerr_aper8",
+                "kron_radius", "fwhm", "class_star", "flags",
+                "asemi", "bsemi", "theta",
+                "mjd", "ra", "dec", "raerr", "decerr", "x", "y",
             ]
         )
         empty.to_parquet(cache_file)
@@ -233,7 +262,7 @@ def apply_local_joins(df, chip_df, exposure_df, band, config):
     Parameters
     ----------
     df : pd.DataFrame
-        Raw meas data with 'exposure', 'ccdnum', 'mag_auto' columns.
+        Raw meas data with 'exposure', 'ccdnum', 'mag_aper4' columns.
     chip_df : pd.DataFrame
         Chip lookup with (exposure, ccdnum, zpterm).
     exposure_df : pd.DataFrame
@@ -263,8 +292,8 @@ def apply_local_joins(df, chip_df, exposure_df, band, config):
                   on=["exposure", "ccdnum"], how="inner")
 
     # Compute instrumental magnitude
-    df["m_inst"] = df["mag_auto"] - df["zpterm"]
-    df["m_err"] = df["magerr_auto"]
+    df["m_inst"] = df["mag_aper4"] - df["zpterm"]
+    df["m_err"] = df["magerr_aper4"]
     df["band"] = band
 
     # Select final columns
@@ -286,37 +315,38 @@ def apply_local_joins(df, chip_df, exposure_df, band, config):
 
 
 def apply_detection_cap(df, max_per_star, rng=None):
-    """Cap detections per star to max_per_star via random subsampling.
+    """Cap detections per star to max_per_star, keeping the best detections.
+
+    For stars exceeding the cap, selects detections with the smallest
+    photometric errors. This avoids the problem of random subsampling
+    selecting non-representative detections for heavily-observed stars
+    (e.g., DES deep fields with 1000+ detections).
 
     Parameters
     ----------
     df : pd.DataFrame
-        Detection table with 'objectid' column.
+        Detection table with 'objectid' and 'm_err' columns.
     max_per_star : int
         Maximum detections per star.
     rng : np.random.Generator, optional
-        Random number generator for reproducibility.
+        Random number generator (unused, kept for API compat).
 
     Returns
     -------
     df_capped : pd.DataFrame
         Detection table with at most max_per_star detections per objectid.
     """
-    if rng is None:
-        rng = np.random.default_rng(42)
-
     totals = df.groupby("objectid")["objectid"].transform("count")
 
     # For stars with <= max_per_star detections, keep all
     mask_keep = totals <= max_per_star
 
-    # For stars with > max_per_star, randomly subsample
+    # For stars with > max_per_star, keep the best (lowest error) detections
     needs_cap = df[~mask_keep]
     if len(needs_cap) > 0:
-        seed = rng.integers(2**31)
         sampled_idx = (
             needs_cap.groupby("objectid", group_keys=False)
-            .apply(lambda g: g.sample(n=max_per_star, random_state=seed))
+            .apply(lambda g: g.nsmallest(max_per_star, "m_err"))
             .index
         )
         return pd.concat([df[mask_keep], df.loc[sampled_idx]]).reset_index(drop=True)
@@ -640,6 +670,10 @@ def main():
         help="Limit to test region RA=50-70, Dec=-40 to -25"
     )
     parser.add_argument(
+        "--test-patch", action="store_true",
+        help="Limit to 10x10 deg test patch RA=50-60, Dec=-35 to -25"
+    )
+    parser.add_argument(
         "--config", default=None, help="Path to config.yaml"
     )
     parser.add_argument(
@@ -654,6 +688,10 @@ def main():
         "--dec-max", type=float, default=35.0,
         help="Maximum declination for DELVE footprint (default 35 deg)"
     )
+    parser.add_argument(
+        "--pixels", type=str, default=None,
+        help="Comma-separated list of specific pixel IDs to process (for retrying missing pixels)"
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -665,7 +703,13 @@ def main():
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     # Determine which pixels to process
-    if args.test_region:
+    if args.pixels:
+        pixels = np.array([int(p.strip()) for p in args.pixels.split(",")])
+        print(f"Specific pixels: {len(pixels)} pixels: {sorted(pixels)}", flush=True)
+    elif args.test_patch:
+        pixels = get_test_patch_pixels(nside)
+        print(f"Test patch (10x10 deg): {len(pixels)} HEALPix pixels (nside={nside})", flush=True)
+    elif args.test_region:
         pixels = get_test_region_pixels(nside)
         print(f"Test region: {len(pixels)} HEALPix pixels (nside={nside})", flush=True)
     else:

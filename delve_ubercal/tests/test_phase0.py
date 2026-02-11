@@ -54,9 +54,9 @@ class TestBuildPixelQuery:
     def test_contains_quality_cuts(self, config):
         query = build_pixel_query(1000, 32, "g", config)
         assert "class_star > 0.8" in query
-        assert "magerr_auto < 0.05" in query
-        assert "mag_auto > 17.0" in query
-        assert "mag_auto < 20.0" in query
+        assert "magerr_aper4 < 0.05" in query
+        assert "mag_aper4 > 17.0" in query
+        assert "mag_aper4 < 20.0" in query
         assert "61" in query  # excluded CCD
 
     def test_contains_band_filter(self, config):
@@ -68,10 +68,17 @@ class TestBuildPixelQuery:
         query = build_pixel_query(1000, 32, "g", config)
         assert "JOIN" not in query
 
-    def test_selects_mag_auto(self, config):
-        """Query should select mag_auto (zpterm correction done locally)."""
+    def test_selects_mag_aper4(self, config):
+        """Query should select mag_aper4 (zpterm correction done locally)."""
         query = build_pixel_query(1000, 32, "g", config)
-        assert "mag_auto" in query
+        assert "mag_aper4" in query
+
+    def test_selects_all_photometry_columns(self, config):
+        """Query should select all aperture mags, auto, fwhm, and shape params."""
+        query = build_pixel_query(1000, 32, "g", config)
+        for col in ["mag_auto", "mag_aper1", "mag_aper2", "mag_aper4", "mag_aper8",
+                     "fwhm", "class_star", "kron_radius", "asemi", "bsemi"]:
+            assert col in query, f"Missing column: {col}"
 
 
 class TestLocalJoins:
@@ -81,8 +88,8 @@ class TestLocalJoins:
             "objectid": ["obj1", "obj2", "obj3"],
             "exposure": ["exp1", "exp1", "exp2"],
             "ccdnum": [1, 2, 1],
-            "mag_auto": [18.0, 19.0, 17.5],
-            "magerr_auto": [0.01, 0.02, 0.015],
+            "mag_aper4": [18.0, 19.0, 17.5],
+            "magerr_aper4": [0.01, 0.02, 0.015],
             "mjd": [57000.0, 57000.0, 57001.0],
             "ra": [60.0, 60.1, 60.2],
             "dec": [-35.0, -35.1, -35.2],
@@ -113,8 +120,8 @@ class TestLocalJoins:
             "objectid": ["obj1", "obj2"],
             "exposure": ["exp1", "exp2"],
             "ccdnum": [1, 1],
-            "mag_auto": [18.0, 19.0],
-            "magerr_auto": [0.01, 0.02],
+            "mag_aper4": [18.0, 19.0],
+            "magerr_aper4": [0.01, 0.02],
             "mjd": [57000.0, 57001.0],
             "ra": [60.0, 60.1],
             "dec": [-35.0, -35.1],
@@ -141,25 +148,33 @@ class TestDetectionCap:
         """Stars with <= 25 detections should be unchanged."""
         df = pd.DataFrame({
             "objectid": ["star1"] * 5 + ["star2"] * 10,
+            "m_err": np.random.default_rng(0).uniform(0.01, 0.05, 15),
             "val": range(15),
         })
         result = apply_detection_cap(df, 25)
         assert len(result) == 15
 
     def test_cap_applied(self):
-        """Stars with > 25 detections should be subsampled."""
+        """Stars with > 25 detections should keep lowest-error detections."""
+        rng = np.random.default_rng(42)
+        errs = rng.uniform(0.001, 0.05, 50)
         df = pd.DataFrame({
             "objectid": ["star1"] * 50,
+            "m_err": errs,
             "val": range(50),
         })
         result = apply_detection_cap(df, 25)
         assert len(result) == 25
         assert result["objectid"].nunique() == 1
+        # The kept detections should be the 25 with smallest errors
+        assert result["m_err"].max() <= np.sort(errs)[25]
 
     def test_mixed(self):
         """Mix of stars above and below cap."""
+        rng = np.random.default_rng(42)
         df = pd.DataFrame({
             "objectid": ["star1"] * 5 + ["star2"] * 50 + ["star3"] * 25,
+            "m_err": rng.uniform(0.01, 0.05, 80),
             "val": range(80),
         })
         result = apply_detection_cap(df, 25)
@@ -168,17 +183,19 @@ class TestDetectionCap:
         assert counts["star2"] == 25
         assert counts["star3"] == 25
 
-    def test_reproducible(self):
-        """Same RNG seed gives same result."""
+    def test_deterministic(self):
+        """Best-error selection is deterministic (no RNG dependence)."""
+        errs = np.linspace(0.001, 0.05, 100)
         df = pd.DataFrame({
             "objectid": ["star1"] * 100,
+            "m_err": errs,
             "val": range(100),
         })
-        rng1 = np.random.default_rng(42)
-        rng2 = np.random.default_rng(42)
-        r1 = apply_detection_cap(df, 25, rng=rng1)
-        r2 = apply_detection_cap(df, 25, rng=rng2)
+        r1 = apply_detection_cap(df, 25)
+        r2 = apply_detection_cap(df, 25)
         assert r1["val"].tolist() == r2["val"].tolist()
+        # Should keep the first 25 (lowest errors)
+        assert r1["val"].tolist() == list(range(25))
 
 
 class TestFilterMinDetections:

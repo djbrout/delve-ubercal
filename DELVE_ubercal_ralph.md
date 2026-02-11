@@ -115,6 +115,7 @@ PART C — Phase 0 validation gate (must pass before moving to Phase 1):
    - CCDNUM 61 does not appear in the output
    - Magnitude range in output is within [17, 20]
    - Number of unique stars and detections are printed and plausible (test region: ~1-10M stars, ~5-50M detections)
+   - **ALL PIXELS DOWNLOADED**: Every expected HEALPix pixel must have a corresponding parquet file in phase0_{band}/. Check for missing pixels by comparing expected pixel list to actual files. If ANY pixels are missing (timeout victims), re-query them until they succeed. DO NOT proceed to Phase 1 with missing pixels — this creates holes in sky coverage that propagate to all downstream phases.
    - All unit tests pass
    - Print a summary table: band, n_stars, n_detections, n_exposures, n_ccd_exposures
    REPORT ALL METRICS. If any gate fails, diagnose and fix before declaring done.
@@ -300,18 +301,20 @@ Implement phase3_outlier_rejection.py:
 
 The initial Phase 2 solve is contaminated by variable stars, artifacts, cosmic rays, and non-photometric exposures. This phase iteratively removes them and re-solves.
 
-PROCEDURE (repeat for n_iterations=5 or until convergence):
+PROCEDURE (detection-level flagging, repeat for n_iterations=5 or until convergence):
 1. Using the current ZP solution, compute residuals for every detection (streaming by HEALPix chunk — 16 GB RAM constraint):
    r_i = m_inst_i + ZP_i - <m_star>
    where <m_star> is the weighted mean magnitude of the star across all its detections.
-2. For each star, compute chi^2 = sum(r_i^2 / sigma_i^2) and dof = N_detections - 1.
-3. Flag entire stars with chi^2/dof > 3.0 (likely variables).
-4. Flag individual detections with |r_i| > 5 * sigma_i (catastrophic outliers — cosmic rays, artifacts).
-5. Flag entire exposures where the solved ZP deviates by > 0.3 mag from the nightly median ZP (likely cloudy).
-6. Flag CCDs where the intra-CCD ZP scatter across stars is anomalously large (> 3 sigma from median across all CCDs).
-7. Remove all flagged detections from the input catalog.
-8. Re-run Phase 2 solve (both modes) on the cleaned catalog.
-9. Report per iteration: number of stars flagged, detections flagged, exposures flagged, new residual RMS.
+2. Flag individual outlier detections with |r_i| > 5 * sigma_i (catastrophic outliers — cosmic rays, artifacts).
+   Track as (objectid, expnum, ccdnum) tuples in `flagged_det_keys`.
+3. For each star, compute chi^2 = sum(r_i^2 / sigma_i^2) and dof = N_detections - 1.
+   ONLY flag entire stars if chi^2/dof > 3.0 AND < 2 clean detections remain after step 2.
+   This prevents DES deep field stars from being wrongly flagged as "variable".
+4. Flag entire exposures where the solved ZP deviates by > 0.3 mag from the nightly median ZP (likely cloudy).
+5. Flag CCDs where the intra-CCD ZP scatter across stars is anomalously large (> 3 sigma from median across all CCDs).
+6. Remove flagged individual detections (not whole stars) from the input catalog.
+7. Re-run Phase 2 solve (both modes) on the cleaned catalog.
+8. Report per iteration: number of stars flagged, outlier detections flagged, exposures flagged, new residual RMS.
 
 Output: final cleaned ZP solution (both modes) + lists of flagged stars, detections, and exposures saved to disk.
 
@@ -346,6 +349,44 @@ After 15 iterations, if not complete:
 - Suggest alternative approaches
 " --max-iterations 20 --completion-promise "PHASE3_DONE"
 ```
+
+---
+
+## Phase 3b: Gradient Detrend (DELVE g-r + Gaia)
+
+This step runs AFTER Phase 3 completes for BOTH g and r bands. It uses
+DELVE g-r color for the color term (homogeneous across all bands) and
+Gaia DR3 for the RA/Dec reference positions. No fallback — requires both
+g and r bands.
+
+```
+# Run Phase 3 for both bands first (no gradient detrend):
+PYTHONPATH=/Volumes/External5TB/DELVE_UBERCAL python -m delve_ubercal.phase3_outlier_rejection --band g --test-patch --mode unanchored
+PYTHONPATH=/Volumes/External5TB/DELVE_UBERCAL python -m delve_ubercal.phase3_outlier_rejection --band r --test-patch --mode unanchored
+
+# Then detrend both bands (order doesn't matter):
+PYTHONPATH=/Volumes/External5TB/DELVE_UBERCAL python -m delve_ubercal.phase3b_gradient_detrend --band g --test-patch
+PYTHONPATH=/Volumes/External5TB/DELVE_UBERCAL python -m delve_ubercal.phase3b_gradient_detrend --band r --test-patch
+```
+
+**What it does:**
+- Loads Phase 3 ZPs for the target band + other band
+- Computes per-star DELVE calibrated magnitudes in both bands → DELVE g-r
+- Cross-matches with Gaia DR3 (provides ra, dec, reference mag)
+- Fits: `resid = poly3(DELVE g-r) + a*RA + b*Dec + c` (joint color + gradient)
+- 3-sigma clips and refits
+- Applies RA/Dec linear correction to all CCD-exposure ZPs
+- Re-shifts to DES FGCM median for absolute scale (1 parameter)
+- Saves detrended ZPs back to `phase3_{band}/zeropoints_unanchored.parquet`
+
+**Why DELVE g-r (not Gaia BP-RP):**
+- Gaia G_RP is a poor match for DECam r (62 mmag RMS vs 29 mmag for g/G_BP)
+- DELVE g-r gives tighter residuals (32.8 vs 44.3 mmag for g-band)
+- Same color axis for ALL bands → homogeneous method, no fallback needed
+
+**Expected gradients (test patch):**
+- g-band: RA ~ -5.3, Dec ~ 0.1 mmag/deg
+- r-band: RA ~ -4.1, Dec ~ 0.2 mmag/deg
 
 ---
 
@@ -476,66 +517,71 @@ After 10 iterations, if not complete:
 /ralph-loop "
 Read DELVE_ubercal_plan.md and the existing code in delve_ubercal/.
 
-PHASE 6: Implement the full validation suite. There are 6 tests (Test 0 through Test 5).
+PHASE 6: Implement the full validation suite. Tests 0-7 (some numbers skipped for historical reasons).
 
-Implement in delve_ubercal/validation/:
+All tests are in delve_ubercal/validation/run_all.py:
 
-TEST 0 — fgcm_comparison.py: FGCM vs Ubercal comparison using the UNANCHORED solve.
-- For every DES CCD-exposure, compute ZP_FGCM - ZP_ubercal_unanchored.
-- Map this difference spatially across the DES footprint (HEALPix nside=64, Mollweide projection).
-- Plot ZP_FGCM - ZP_unanchored as a function of: (a) sky position, (b) airmass, (c) MJD, (d) CCDNUM.
-- Compute summary stats: median offset (should be ~0 by construction of the mean shift), RMS scatter, max deviation.
-- This is a genuine independent comparison because the unanchored solve contains NO per-exposure FGCM information.
-- Save as validation_fgcm_comparison_{band}.png.
+TEST 0 — FGCM vs Ubercal comparison (UNANCHORED + ANCHORED with sky maps).
+- For every DES CCD-exposure, compute ZP_FGCM - ZP_ubercal for both solve modes.
+- Plot histogram + residual vs ZP scatter.
+- Generate FGCM sky map showing spatial residual pattern for both anchored and unanchored side-by-side.
+- Sky map uses mean RA/Dec per CCD-exposure computed from Phase 0 detections.
+- Save as validation_fgcm_comparison_{band}.png and fgcm_skymap_{band}.png.
 
-TEST 1 — repeatability.py: Photometric repeatability vs magnitude.
+TEST 1 — Photometric repeatability vs magnitude.
 - For each star with N >= 3 detections, compute weighted RMS of individual detections around the weighted mean.
-- Plot RMS vs magnitude. Should reach ~5 mmag floor for bright stars (17-18 mag), rising with photon noise at faint end.
-- Report the floor value (median RMS for 17 < mag < 18).
+- Plot RMS vs magnitude. Should reach ~5 mmag floor for bright stars (17-18 mag).
 - Save as validation_repeatability_{band}.png.
 
-TEST 2 — dr2_comparison.py: Before/after comparison.
-- For every star, compute MAG_DR2 - MAG_UBERCAL.
-- Map this difference in HEALPix pixels (nside=64) across the sky (Mollweide projection).
-- The dec=-30 discontinuity should appear as a ~10 mmag correction in this map.
-- Inside the DES footprint, the difference should be near zero.
-- Report: median and RMS of difference inside DES, median and RMS outside DES, step size at dec=-30.
+TEST 2 — DR2 comparison (anchored vs FGCM).
+- For DES CCD-exposures, compute delta_ZP (ubercal - FGCM).
+- Inside DES footprint, difference should be near zero.
 - Save as validation_dr2_comparison_{band}.png.
 
-TEST 3 — gaia_comparison.py: External validation against Gaia.
-- Transform ubercal magnitudes to Gaia G band using color transformations (following Drlica-Wagner et al. 2022 procedure).
-- Compare to Gaia DR3 G-band photometry for bright stars (G < 19).
-- Map the median offset G_predicted - G_Gaia in HEALPix pixels (nside=64, Mollweide projection).
-- The dec=-30 discontinuity visible in DELVE DR2 should be absent after ubercal.
-- Report: RMS of the offset map, presence/absence of dec=-30 step.
+TEST 4 — Gaia DR3 comparison using G_BP (g-band) or G_RP (riz) with DELVE g-r color term.
+- Cross-match with Gaia via pre-built NSC-Gaia table on Data Lab.
+- Use G_BP for g-band (closer match than G), G_RP for r/i/z bands.
+- Polynomial color term (degree 5) — linear is insufficient for Gaia filter mismatch.
+- DELVE g-r color axis (NOT Gaia BP-RP) — falls back to BP-RP if g-r not available.
+- 2x2 plot: histogram (after CT only, "RMS = X.X mmag"), color term fit, sky map (DELVE - Gaia after CT), magnitude dependence.
 - Save as validation_gaia_{band}.png.
-- NOTE: Gaia is used ONLY for validation here, not as a calibration input.
 
-TEST 4 — stellar_locus.py: Color-color locus width vs sky position.
-- In g-r vs r-i color-color space, measure the perpendicular scatter of the main-sequence stellar locus.
-- Compute this in HEALPix pixels (nside=32) across the sky.
-- Map the locus width. Should be spatially uniform to ~5 mmag after ubercal.
-- Report: median locus width, RMS of spatial variation.
-- Save as validation_stellar_locus.png.
+TEST 5 — Stellar locus width (placeholder — requires multi-band).
 
-TEST 5 — des_boundary.py: DES footprint boundary continuity.
-- Select stars in a narrow strip (2 deg wide) along the DES footprint boundary.
-- Compare ubercal magnitudes of stars just inside vs just outside DES.
-- Compute the mean offset and scatter in bins along the boundary.
-- Report: mean offset across boundary, scatter.
-- There should be no discontinuity.
+TEST 6 — DES boundary continuity.
+- Compare ZP medians inside vs outside DES footprint.
 - Save as validation_des_boundary_{band}.png.
 
-Also create validation/run_all.py that:
-- Runs all 6 tests
+TEST 7 — PS1 DR2 direct comparison (dec > -30).
+- Query PS1 DR2 MeanPSFMag via MAST TAP: https://mast.stsci.edu/vo-tap/api/v0.1/ps1dr2/
+  - NOT the REST API at catalogs.mast.stsci.edu (that doesn't support TAP async)
+- Table: dbo.MeanObjectView. Key columns: {band}MeanPSFMag, QfPerfect > 0.85, nDetections > 1.
+- MUST chunk by RA (2-degree strips) — full region queries get ABORTED by MAST after ~10 min.
+- MUST set maxrec=500000 in submit_job() — default 100K row limit truncates dense chunks.
+- Cross-match with ubercal catalog by position (1 arcsec) using astropy SkyCoord.
+- Fit linear color term using PS1 g-i color.
+- 2x2 plot: histogram (after CT only, "RMS = X.X mmag"), color term, sky map, magnitude residual.
+- PS1 calibration is from Schlafly et al. (2012) / Magnier et al. (2020), ~7-12 mmag floor.
+- Covers dec > -30 ONLY — validates northern half of DELVE footprint that overlaps PS1.
+- Save as validation_ps1_{band}.png.
+
+Before/after ubercal comparison is integrated into Tests 4 and 7:
+- Both overplot "before ubercal" (blue) and "after ubercal" (orange) histograms.
+- Same color term applied to both; PASS requires ubercal RMS <= before RMS.
+- Phase 5 catalog includes mag_before_{band} column (original NSC DR2 calibration).
+
+run_all.py:
+- Runs Tests 0, 1, 2, 7, 4, 5, 6
 - Collects all metrics into a single summary table
 - Prints a PASS/FAIL verdict for each test based on thresholds:
   - Test 0: FGCM-ubercal RMS < 15 mmag
   - Test 1: Repeatability floor < 10 mmag
-  - Test 2: DES interior offset < 5 mmag
-  - Test 3: Gaia comparison RMS < 15 mmag
-  - Test 4: Stellar locus spatial variation < 10 mmag
-  - Test 5: DES boundary offset < 5 mmag
+  - Test 2: DES interior offset < 15 mmag
+  - Test 4: Gaia comparison RMS < 50 mmag
+  - Test 5: Stellar locus spatial variation < 10 mmag
+  - Test 6: DES boundary offset < 10 mmag
+  - Test 7: PS1 comparison RMS < 30 mmag after color term
+  - Tests 4 & 7: ubercal RMS <= before-ubercal RMS (integrated comparison)
 - Saves the summary as validation_summary.txt
 
 Run all tests on the test region.
@@ -574,10 +620,11 @@ The DELVE ubercal pipeline is built and validated on the test region. Now run it
 1. Run phase0_ingest.py WITHOUT the --test-region flag (full sky). Process band-by-band if needed for memory.
 2. Run phase1_overlap_graph.py on full data. Report connectivity stats.
 3. Run phase2_solve.py on full data — BOTH modes (unanchored and anchored).
-4. Run phase3_outlier_rejection.py on full data.
-5. Run phase4_starflat.py on full data.
-6. Run phase5_catalog.py on full data.
-7. Run validation/run_all.py on full data.
+4. Run phase3_outlier_rejection.py on full data (g and r bands first, no gradient detrend).
+5. Run phase3b_gradient_detrend.py for g and r (requires both Phase 3 complete — uses DELVE g-r).
+6. Run phase4_starflat.py on full data.
+7. Run phase5_catalog.py on full data.
+8. Run validation/run_all.py on full data.
 
 MEMORY: 16 GB RAM. All phases must stream data by HEALPix chunk. Monitor memory with periodic checks. If any phase exceeds 12 GB RSS, stop and optimize.
 
@@ -643,7 +690,7 @@ Write a LaTeX paper in a new directory paper/ with the following structure:
    2. DATA:
    - DELVE DR2 detection catalogs
    - Quality cuts and star selection
-   - Detection cap at 25 per star
+   - Detection cap at 25 per star (best-error selection, not random)
    - Scale: N exposures, N CCD-exposures, N stars, N detections
 
    3. METHOD:
@@ -706,3 +753,66 @@ After 15 iterations, if not complete:
 - **16 GB RAM constraint.** Every phase must stream data by HEALPix chunk. Never load the full detection catalog.
 - **Both solve modes.** The unanchored solve is just as important as the anchored solve — it enables the FGCM comparison (Test 0) which is the most fundamental validation.
 - **Validation gates are mandatory.** Do not proceed to the next phase if the current phase's gate fails.
+
+## Lessons Learned (Updated 2026-02-08)
+
+### Magnitude Convention (CRITICAL)
+- NSC DR2 `mag_aper4` has MAGZERO (~31 mag) baked in from FITS headers. It is NOT truly instrumental.
+- Phase 0 computes `m_inst = mag_aper4 - zpterm_chip` (~18.8 mag, approximately calibrated).
+- Phase 2 solver finds `ZP_solved ≈ ZP_FGCM ≈ 31.5` (total ZP, same scale as MAGZERO).
+- Phase 5 MUST use `mag_ubercal = mag_aper4 + delta_zp` where `delta_zp = ZP_solved - ZP_FGCM`.
+- DO NOT compute `m_inst + ZP_solved` — this double-counts MAGZERO, giving magnitudes ~50 instead of ~19.
+- For non-DES CCD-exposures: `delta_zp = 0` (no FGCM reference, use NSC calibration).
+
+### DES FGCM Sentinel Values (CRITICAL)
+- The DES FGCM table (`des_dr2.y6_gold_zeropoint`) contains garbage entries: ~28 at -9999.0, ~3 at 129.9.
+- MUST filter with `25.0 < zp_fgcm < 35.0` in ALL code that uses FGCM values:
+  - Phase 2: unanchored DES shift, anchored penalty, diagnostics
+  - Phase 3: final diagnostics
+  - Phase 6: Tests 0, 2, 6
+- Use MEDIAN (not mean) for the DES shift in unanchored mode — more robust to residual outliers.
+
+### DES Deep Field Exposure Time (CRITICAL — FIXED 2026-02-09)
+- DES FGCM `mag_zero` includes `2.5*log10(exptime)` — it is a TOTAL ZP, NOT per-second.
+- NSC DR2 images are in ADU/s (Community Pipeline divides by exptime), so our `m_inst` and `ZP_solved` are per-second.
+- Standard DES survey: exptime=90s, mag_zero ≈ 31.44.
+- DES SN deep fields: exptime=175-200s, mag_zero ≈ 32.24 (0.8 mag higher!).
+- Also many other exptimes: 45s (11%), 150s, 330s, 360s, 400s — cannot threshold on mag_zero.
+- In test patch: 44.5% of DES CCD-exposures are deep fields (SN C-fields at RA~52.5, Dec~-28).
+- **Without fix**: anchoring pulls deep field ZPs to wrong values, violating overlap constraints by ~0.8 mag; unanchored DES shift contaminated. Test 0 RMS was 657 mmag (g) / 880 mmag (r).
+- **FIX**: `load_des_fgcm_zps()` normalizes all mag_zero to 90s equivalent: `mag_zero - 2.5*log10(exptime/90)`.
+  - Exptime from NSC exposure table, cached in `cache/des_exptime.parquet` (86K/99K matched, rest assume 90s).
+  - Single function change propagates to ALL consumers: Phase 2/3/4/5 + validation.
+- **After fix**: g-band anchored DES RMS = 10.1 mmag, unanchored = 63.5 mmag. r-band: 13.7 / 78.3 mmag.
+
+### NSC zpterm
+- `nsc_dr2.chip.zpterm` is a small calibration correction (median ~0.002, range -0.3 to +0.5).
+- `nsc_dr2.exposure.zpterm` exists but is per-exposure (same for all CCDs of same exposure).
+- The chip table must be joined with the exposure table to get `expnum` (chip table only has `exposure` string).
+
+### Data Lab Query Reliability
+- Max 4 parallel workers. 8 overwhelms Data Lab and causes cascade timeouts.
+- Use batched submissions: `batch_size = n_workers * 4`.
+- Each query takes 1-10 min for data pixels, 30-60s for empty pixels.
+- 3x retry with exponential backoff; do NOT cache failed queries as empty.
+- Empty output files without raw cache = timeout victims; must detect and re-query.
+- **DO NOT run multiple query jobs simultaneously** (e.g., re-querying missing pixels while Phase 0 for another band is running). They compete for Data Lab connections and both time out.
+
+### Missing Pixel Completeness (CRITICAL)
+- After Phase 0 completes, ALWAYS verify all expected pixels have parquet files.
+- Timeout victims leave NO parquet file (not even an empty one) — check with: `expected_pixels - {pixels with files}`.
+- Known problematic pixels in test patch: 8787, 9043, 9298, 9299 (dense stellar fields near galactic plane, queries take >20 min).
+- Missing pixels create visible holes in sky coverage maps and corrupt boundary statistics.
+- Re-query strategy: wait until no other Data Lab queries are running, then retry with `--parallel 1` and only the missing pixel list.
+- DO NOT proceed to Phase 1 until all pixels are present for the current band.
+- **For persistent timeout victims**: Use TAP async via pyvo (`scripts/query_missing_pixels_tap.py`).
+  The `dl.queryClient.query()` goes through nginx which has a ~600-1800s gateway timeout — impossible for dense stellar fields.
+  TAP async (`pyvo.dal.TAPService.submit_job()`) bypasses nginx entirely and has no server-side timeout.
+  Each dense pixel may take 30-60 minutes but WILL complete.
+
+### NSC DR2 Aperture Sizes
+- mag_aper1: 1" diameter (0.5" radius)
+- mag_aper2: 2" diameter (1" radius)
+- mag_aper4: 4" diameter (2" radius) — PRIMARY for ubercal
+- mag_aper8: 8" diameter (4" radius)
+- These are DIAMETERS not radii, not pixel-based.

@@ -15,9 +15,9 @@ data:
   cache_path: /Volumes/External5TB/DELVE_UBERCAL/cache/       # Local parquet cache of query results
 
 quality_cuts:
-  mag_min: 17.0                # mag_auto from nsc_dr2.meas
+  mag_min: 17.0                # mag_aper4 from nsc_dr2.meas (4-arcsec diameter = 2-arcsec radius fixed aperture)
   mag_max: 20.0
-  magerr_max: 0.05             # magerr_auto from nsc_dr2.meas
+  magerr_max: 0.05             # magerr_aper4 from nsc_dr2.meas
   flags_max: 0                 # NSC flags (0 = clean)
   class_star_min: 0.8          # SExtractor CLASS_STAR from nsc_dr2.meas (no spread_model available)
   min_detections_per_star: 2
@@ -29,19 +29,28 @@ solve:
   method: cg                # Conjugate gradient on normal equations
   max_iterations: 5000
   tolerance: 1.0e-5         # Relative residual
-  des_anchor_weight: 1.0e6  # Penalty weight for DES ZP anchoring (anchored mode)
-  tikhonov_reg: 1.0e-10     # Diagonal regularization (unanchored mode)
+  des_anchor_weight: 1.0e6  # Penalty weight for DES ZP anchoring (anchored mode, currently unused)
+  tikhonov_reg: 1.0e-10     # Diagonal regularization for CCD-exposure solve (unanchored mode)
+  gradient_detrend: gaia     # Remove linear RA/Dec gradient from unanchored solution.
+                             # Options: "gaia" (all-sky, independent of DES), "fgcm" (DES-only), false
+                             # "gaia": fits color term + linear gradient vs Gaia DR3 at star level
+                             # "fgcm": uses 2 DES FGCM parameters (RA slope, Dec slope)
+  exposure_reg_weight: 0     # Exposure-level regularization: penalizes within-exposure
+                             # CCD-to-CCD ZP variation. Prior std = 1/sqrt(weight). 0 = disabled.
 
 outlier_rejection:
   n_iterations: 5
   star_chi2_cut: 3.0        # chi2/dof threshold for star rejection
-  detection_sigma_cut: 5.0  # Individual detection outlier threshold
+  detection_sigma_cut: 4.0  # Individual detection outlier threshold (was 5.0)
   exposure_zp_cut: 0.3      # Max deviation from nightly median ZP (mag)
 
 starflat:
   enabled: true
   polynomial_order: 3       # Per-CCD 2D Chebyshev order
   min_stars_per_bin: 50
+  gray_smooth_sigma: 0       # Temporal smoothness prior: σ in mag between consecutive
+                             # exposures within same night. 0 = disabled.
+                             # Tested σ=10 mmag: no improvement (problem is spatial, not temporal).
   # Hardware-driven epoch boundaries (MJD)
   epoch_boundaries:
     global:                  # Apply to all CCDs

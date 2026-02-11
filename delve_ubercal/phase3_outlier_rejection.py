@@ -11,13 +11,17 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from delve_ubercal.phase0_ingest import get_test_region_pixels, load_config
+from delve_ubercal.phase0_ingest import get_test_patch_pixels, get_test_region_pixels, load_config
 from delve_ubercal.phase2_solve import (
+    accumulate_gray_normal_equations,
     accumulate_normal_equations,
     build_node_index,
+    compute_node_positions,
+    compute_star_flat,
     load_des_fgcm_zps,
     load_nsc_zpterms,
     solve_anchored,
+    solve_gray_unanchored,
     solve_unanchored,
 )
 from delve_ubercal.utils.healpix_utils import get_all_healpix_pixels
@@ -180,8 +184,11 @@ def flag_bad_exposures(zp_solved_df, exposure_mjds, zp_cut):
     return flagged
 
 
-def flag_bad_ccds(residuals_df, sigma_factor=3.0):
+def flag_bad_ccds(residuals_df, sigma_factor=3.0, min_scatter_mag=0.05):
     """Flag CCDs with anomalously large intra-CCD scatter.
+
+    Uses max(relative_threshold, min_scatter_mag) to prevent
+    over-flagging when the solution is tight.
 
     Returns set of (expnum, ccdnum) nodes.
     """
@@ -199,23 +206,31 @@ def flag_bad_ccds(residuals_df, sigma_factor=3.0):
     # Robust sigma estimate
     sigma_est = 1.4826 * mad if mad > 0 else node_stats["std"].std()
 
-    threshold = median_scatter + sigma_factor * sigma_est
+    relative_threshold = median_scatter + sigma_factor * sigma_est
+    threshold = max(relative_threshold, min_scatter_mag)
     bad = node_stats[node_stats["std"] > threshold]
     return set(zip(bad["expnum"].values, bad["ccdnum"].values))
 
 
-def apply_flags_to_star_lists(star_list_files, flagged_stars, flagged_detection_mask,
+def apply_flags_to_star_lists(star_list_files, flagged_stars, flagged_det_keys,
                                flagged_exposures, flagged_nodes, output_dir):
     """Remove flagged detections and write cleaned star lists.
+
+    Parameters
+    ----------
+    flagged_stars : set
+        Objectids to remove entirely.
+    flagged_det_keys : set or None
+        (objectid, expnum, ccdnum) tuples for individual detection removal.
+    flagged_exposures : set
+        Expnums to remove entirely.
+    flagged_nodes : set
+        (expnum, ccdnum) tuples to remove entirely.
 
     Returns list of cleaned file paths.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     cleaned_files = []
-
-    # If we have a detection-level mask, we need to process differently
-    # Build a set of flagged (objectid, expnum, ccdnum) for detection-level flags
-    # For simplicity, we process file-by-file and re-apply the criteria
 
     for f in star_list_files:
         df = pd.read_parquet(f)
@@ -225,11 +240,20 @@ def apply_flags_to_star_lists(star_list_files, flagged_stars, flagged_detection_
             cleaned_files.append(out_f)
             continue
 
-        n_before = len(df)
-
         # Remove flagged stars
         if flagged_stars:
             df = df[~df["objectid"].isin(flagged_stars)]
+
+        # Remove individual flagged detections
+        if flagged_det_keys:
+            det_keys = set(zip(
+                df["objectid"].values, df["expnum"].values, df["ccdnum"].values
+            ))
+            bad_det_mask = np.array([
+                (o, e, c) in flagged_det_keys
+                for o, e, c in zip(df["objectid"].values, df["expnum"].values, df["ccdnum"].values)
+            ])
+            df = df[~bad_det_mask]
 
         # Remove flagged exposures
         if flagged_exposures:
@@ -237,7 +261,6 @@ def apply_flags_to_star_lists(star_list_files, flagged_stars, flagged_detection_
 
         # Remove flagged nodes (bad CCDs)
         if flagged_nodes:
-            node_keys = set(zip(df["expnum"].values, df["ccdnum"].values))
             bad_mask = np.array([
                 (e, c) in flagged_nodes
                 for e, c in zip(df["expnum"].values, df["ccdnum"].values)
@@ -330,6 +353,7 @@ def run_outlier_rejection(band, pixels, config, output_dir, cache_dir, mode="bot
     all_flagged_stars = set()
     all_flagged_exposures = set()
     all_flagged_nodes = set()
+    all_flagged_det_keys = set()  # (objectid, expnum, ccdnum) tuples
     total_detections_flagged = 0
 
     iteration_stats = []
@@ -349,21 +373,33 @@ def run_outlier_rejection(band, pixels, config, output_dir, cache_dir, mode="bot
         n_det_total = len(residuals_df)
         rms_before = np.sqrt(np.mean(residuals_df["residual"].values ** 2)) * 1000
 
-        # 2. Flag variable stars
-        new_flagged_stars = flag_variable_stars(residuals_df, chi2_cut)
-        new_flagged_stars -= all_flagged_stars  # Only new ones
-
-        # 3. Flag outlier detections (counted but applied via star-level removal)
+        # 2. Flag individual outlier detections (not whole stars)
         det_mask = flag_outlier_detections(residuals_df, sigma_cut)
         n_outlier_dets = int(det_mask.sum())
 
-        # For detection-level flagging, flag stars that have > 50% outlier detections
-        outlier_df = residuals_df[det_mask]
-        if len(outlier_df) > 0:
-            outlier_star_counts = outlier_df.groupby("objectid").size()
+        # Collect flagged (objectid, expnum, ccdnum) tuples for detection-level removal
+        outlier_dets = residuals_df[det_mask]
+        new_flagged_det_keys = set(zip(
+            outlier_dets["objectid"].values,
+            outlier_dets["expnum"].values,
+            outlier_dets["ccdnum"].values,
+        ))
+        all_flagged_det_keys |= new_flagged_det_keys
+
+        # Flag whole stars ONLY if they have chi2/dof > threshold AND <= 2 clean
+        # detections remaining (i.e., useless after outlier removal)
+        new_flagged_stars = set()
+        high_chi2_stars = flag_variable_stars(residuals_df, chi2_cut)
+        high_chi2_stars -= all_flagged_stars
+        if high_chi2_stars:
             total_star_counts = residuals_df.groupby("objectid").size()
-            for star, n_outlier in outlier_star_counts.items():
-                if n_outlier / total_star_counts.get(star, 1) > 0.5:
+            outlier_star_counts = outlier_dets.groupby("objectid").size() if len(outlier_dets) > 0 else pd.Series(dtype=int)
+            for star in high_chi2_stars:
+                n_total = total_star_counts.get(star, 0)
+                n_bad = outlier_star_counts.get(star, 0)
+                n_clean = n_total - n_bad
+                if n_clean < 2:
+                    # Star has < 2 clean detections — flag it entirely
                     new_flagged_stars.add(star)
 
         # 4. Flag bad exposures
@@ -397,7 +433,7 @@ def run_outlier_rejection(band, pixels, config, output_dir, cache_dir, mode="bot
         # 6. Apply flags and write cleaned star lists
         clean_dir = phase3_dir / f"iter{iteration}"
         cleaned_files = apply_flags_to_star_lists(
-            current_star_files, all_flagged_stars, None,
+            current_star_files, all_flagged_stars, all_flagged_det_keys,
             all_flagged_exposures, all_flagged_nodes, clean_dir
         )
 
@@ -442,11 +478,20 @@ def run_outlier_rejection(band, pixels, config, output_dir, cache_dir, mode="bot
         # Use cleaned files for next iteration
         current_star_files = cleaned_files
 
-        # Check convergence: no new flags
+        # Check convergence: no new flags or RMS worsened
         if n_new_flags == 0:
             print(f"\n  Converged after {iteration} iterations (no new flags).",
                   flush=True)
             break
+
+        # Early stop if RMS is getting worse (instability)
+        if len(iteration_stats) >= 2:
+            prev_rms = iteration_stats[-2]["rms_after_mmag"]
+            curr_rms = iteration_stats[-1]["rms_after_mmag"]
+            if curr_rms > prev_rms * 1.5:
+                print(f"\n  Early stop: RMS worsened ({prev_rms:.1f} -> {curr_rms:.1f} mmag).",
+                      flush=True)
+                break
 
     # Save flagged objects
     pd.DataFrame({"objectid": list(all_flagged_stars)}).to_parquet(
@@ -486,6 +531,101 @@ def run_outlier_rejection(band, pixels, config, output_dir, cache_dir, mode="bot
             zp_solved, info = solve_unanchored(
                 AtWA, rhs, config, node_to_idx, des_fgcm_zps
             )
+
+            # Star flat refinement (decompose ZP into gray + flat)
+            sf_enabled = config.get("starflat", {}).get("enabled", False)
+            if sf_enabled:
+                print(f"\n    --- Star flat refinement ---", flush=True)
+
+                # Compute star flat from per-CCD ZPs (excluding flagged)
+                star_flat, epoch_bounds = compute_star_flat(
+                    zp_solved, idx_to_node, exposure_mjds, config,
+                    flagged_nodes=all_flagged_nodes,
+                    flagged_exposures=all_flagged_exposures,
+                )
+
+                # Build exposure index (exclude flagged)
+                exp_to_idx = {}
+                for expnum, ccdnum in idx_to_node:
+                    if (expnum, ccdnum) in all_flagged_nodes:
+                        continue
+                    if expnum in all_flagged_exposures:
+                        continue
+                    if expnum not in exp_to_idx:
+                        exp_to_idx[expnum] = len(exp_to_idx)
+                n_exp_params = len(exp_to_idx)
+                print(f"    Exposure params: {n_exp_params:,} "
+                      f"(vs {n_params:,} CCD-exposures)", flush=True)
+
+                # Build gray normal equations
+                AtWA_gray, rhs_gray, n_stars_gray, n_pairs_gray, n_intra = \
+                    accumulate_gray_normal_equations(
+                        final_star_files, exp_to_idx, n_exp_params,
+                        star_flat, exposure_mjds, epoch_bounds,
+                    )
+                print(f"    Gray: {n_stars_gray:,} stars, {n_pairs_gray:,} pairs, "
+                      f"{n_intra:,} intra-exp skipped", flush=True)
+
+                # Load node positions for gradient detrend
+                phase0_dir = output_dir / f"phase0_{band}"
+                node_pos_dict = None
+                if config.get("solve", {}).get("gradient_detrend", False):
+                    node_pos_dict = {}
+                    pos_file = phase0_dir / "node_positions.parquet"
+                    if pos_file.exists():
+                        pos_df = pd.read_parquet(pos_file)
+                        for _, row in pos_df.iterrows():
+                            node_pos_dict[(int(row["expnum"]), int(row["ccdnum"]))] = (
+                                row["ra_mean"], row["dec_mean"]
+                            )
+
+                # Solve for gray terms
+                zp_sf, gray_solved, gray_info = solve_gray_unanchored(
+                    AtWA_gray, rhs_gray, config, exp_to_idx, des_fgcm_zps,
+                    star_flat, exposure_mjds, epoch_bounds,
+                    node_to_idx, idx_to_node,
+                    node_positions=node_pos_dict,
+                )
+
+                print(f"    Gray CG: converged={gray_info['converged']}, "
+                      f"iters={gray_info['n_iterations']}, "
+                      f"residual={gray_info['relative_residual']:.2e}", flush=True)
+
+                if gray_info["converged"]:
+                    # NOTE: Gradient detrend is applied as a separate post-Phase 3 step
+                    # (after all bands complete) to ensure consistent DELVE g-r color terms.
+                    # See apply_gradient_detrend() in phase2_solve.py.
+
+                    # Save star flat for diagnostics
+                    sf_records = [
+                        {"ccdnum": k[0], "epoch_idx": k[1], "flat_correction": v}
+                        for k, v in star_flat.items()
+                    ]
+                    pd.DataFrame(sf_records).to_parquet(
+                        phase3_dir / "star_flat.parquet", index=False,
+                    )
+
+                    # Replace per-CCD solution with star flat version
+                    zp_solved = zp_sf
+                    info["mode"] = "unanchored_starflat"
+                    info["n_exp_params"] = gray_info["n_exp_params"]
+                    info["gray_iterations"] = gray_info["n_iterations"]
+                    info["gray_converged"] = gray_info["converged"]
+                else:
+                    print(f"    Star flat CG FAILED, keeping per-CCD result",
+                          flush=True)
+
+            # Spatial detrending disabled — it soft-anchors to FGCM which
+            # won't work outside the DES footprint.  The unanchored solution
+            # with ~20 mmag large-scale modes is the honest representation of
+            # overlap-only calibration quality.
+            # To re-enable: uncomment the block below.
+            # phase0_dir = output_dir / f"phase0_{band}"
+            # node_positions = compute_node_positions(phase0_dir, nside)
+            # grad_info = detrend_spatial_gradient(
+            #     zp_solved, idx_to_node, node_positions, des_fgcm_zps,
+            # )
+            # info["detrend"] = grad_info
         else:
             zp_solved, info = solve_anchored(
                 AtWA, rhs, config, node_to_idx, des_fgcm_zps
@@ -503,8 +643,16 @@ def run_outlier_rejection(band, pixels, config, output_dir, cache_dir, mode="bot
         out_file = phase3_dir / f"zeropoints_{solve_mode}.parquet"
         result_df.to_parquet(out_file, index=False)
 
-        # DES comparison
-        des_mask = result_df["zp_fgcm"].notna()
+        # DES comparison (filter sentinel FGCM values AND flagged nodes)
+        # Flagged nodes have no data in the solve and get Tikhonov-default ZPs
+        flagged_node_mask = np.array([
+            (e, c) in all_flagged_nodes or e in all_flagged_exposures
+            for e, c in zip(result_df["expnum"].values, result_df["ccdnum"].values)
+        ])
+        des_mask = (result_df["zp_fgcm"].notna()
+                    & (result_df["zp_fgcm"] > 25.0) & (result_df["zp_fgcm"] < 35.0)
+                    & ~flagged_node_mask)
+        n_des_clean = int(des_mask.sum())
         if des_mask.any():
             des_diff = result_df.loc[des_mask, "delta_zp"].values
             des_diff_rms = np.sqrt(np.mean(des_diff ** 2)) * 1000
@@ -522,6 +670,7 @@ def run_outlier_rejection(band, pixels, config, output_dir, cache_dir, mode="bot
         print(f"    Iterations:        {info['n_iterations']}", flush=True)
         print(f"    Converged:         {info['converged']}", flush=True)
         print(f"    Rel. residual:     {info['relative_residual']:.2e}", flush=True)
+        print(f"    DES nodes (clean): {n_des_clean:,}", flush=True)
         print(f"    DES diff RMS:      {des_diff_rms:.1f} mmag", flush=True)
         print(f"    DES diff median:   {des_diff_median:.1f} mmag", flush=True)
         print(f"  {'=' * 55}", flush=True)
@@ -577,6 +726,10 @@ def main():
         "--test-region", action="store_true",
         help="Limit to test region",
     )
+    parser.add_argument(
+        "--test-patch", action="store_true",
+        help="Limit to 10x10 deg test patch RA=50-60, Dec=-35 to -25",
+    )
     parser.add_argument("--config", default=None, help="Path to config.yaml")
     args = parser.parse_args()
 
@@ -586,7 +739,10 @@ def main():
     output_dir = Path(config["data"]["output_path"])
     cache_dir = Path(config["data"]["cache_path"])
 
-    if args.test_region:
+    if args.test_patch:
+        pixels = get_test_patch_pixels(nside)
+        print(f"Test patch (10x10 deg): {len(pixels)} pixels (nside={nside})", flush=True)
+    elif args.test_region:
         pixels = get_test_region_pixels(nside)
         print(f"Test region: {len(pixels)} pixels (nside={nside})", flush=True)
     else:

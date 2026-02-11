@@ -20,6 +20,7 @@ build/
 # Output directories
 output/
 cache/
+logs/
 
 # IDE
 .vscode/

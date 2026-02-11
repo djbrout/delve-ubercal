@@ -71,7 +71,7 @@ No local data files are available. All data is queried from the NOIRLab Astro Da
 
 4. **Object grouping:** NSC DR2 already links detections to unique objects via `objectid`. No cross-matching needed. Each unique `objectid` is a unique star.
 
-5. **Detection cap:** For stars with more than 25 detections in a given band, randomly subsample to 25 detections. This caps the per-star contribution to the normal equations at a 25×25 block (300 pairs) without meaningfully degrading the solution — a star observed 25 times already provides excellent constraints.
+5. **Detection cap:** For stars with more than 25 detections in a given band, keep the 25 detections with the smallest photometric errors (`nsmallest("m_err")`). This caps the per-star contribution to the normal equations at a 25×25 block (300 pairs) without meaningfully degrading the solution. Using best-error selection (not random) avoids the DES deep field problem where random subsamples from 1000+ detections span different observing conditions and appear as false variability in Phase 3.
 
 6. Cache downloaded query results locally as parquet files at `/Volumes/External5TB/DELVE_UBERCAL/cache/` to avoid re-querying. Check cache before issuing new queries.
 
@@ -80,6 +80,14 @@ No local data files are available. All data is queried from the NOIRLab Astro Da
 **Output:** A matched star catalog with ~hundreds of millions of individual detections linked to ~hundreds of millions of unique stars.
 
 **Memory management (16 GB RAM constraint):** Process in chunks by HEALPix region (nside=32, ~3 deg² pixels). Query one pixel at a time from Data Lab, apply cuts, write to parquet cache. Never load all detections into memory at once.
+
+**Query timeout handling (CRITICAL):** The standard `dl.queryClient.query()` goes through an nginx reverse proxy with a ~600–1800s gateway timeout. Dense stellar fields (e.g., near the Galactic plane or bulge) can take 30–60 minutes to query, far exceeding this limit. For these stubborn pixels:
+
+1. **Primary method:** Use TAP async via `pyvo` — `pyvo.dal.TAPService.submit_job()` bypasses nginx entirely and has no server-side timeout. See `scripts/query_missing_pixels_tap.py`.
+2. **Workflow:** After Phase 0 completes, check for missing pixels. Any pixel with an output parquet file but no raw cache file is a timeout victim. Re-query using TAP async.
+3. **Do NOT** attempt to work around timeouts with magnitude bin splitting, column reduction, or shorter timeouts — these do not solve the fundamental nginx gateway limit for dense fields.
+
+**Pixel completeness gate:** Before proceeding to Phase 1, verify ALL expected HEALPix pixels have Phase 0 output files. Missing pixels create holes in sky coverage that propagate through all downstream phases. The pipeline orchestrator (`run_full_pipeline.py`) enforces this check automatically with up to 3 retries.
 
 ### Phase 1: Build the Overlap Graph
 
@@ -158,9 +166,20 @@ The solver supports two modes, controlled by config:
 
 **Output:** A table of solved zero-points `ZP_solved` for every CCD-exposure in both modes. The correction applied to the existing calibration is:
 ```
-delta_ZP = ZP_solved - ZP_current
-m_calibrated = m_inst + ZP_solved = m_inst + ZP_current + delta_ZP
+delta_ZP = ZP_solved - ZP_FGCM    (for DES CCD-exposures)
+delta_ZP = 0                       (for non-DES, no FGCM reference)
+mag_ubercal = mag_aper4 + delta_ZP
 ```
+
+**NOTE (2026-02-08):** Do NOT use `m_inst + ZP_solved` — this double-counts MAGZERO (~31 mag) since NSC `mag_aper4` already has MAGZERO baked in. Also filter DES FGCM sentinel values (-9999, 129.9) with `25 < zp_fgcm < 35`.
+
+**CRITICAL (2026-02-09): DES Deep Field Exposure Time Normalization.**
+DES FGCM `mag_zero` includes `2.5*log10(exptime)`. Standard survey uses 90s; DES SN deep fields use 175-200s.
+This creates ~800 mmag offset between deep and survey mag_zero values for the same atmospheric conditions.
+NSC images are in ADU/s, so our m_inst and ZP_solved are per-second quantities — they do NOT depend on exptime.
+**Fix:** Normalize `mag_zero` to 90s equivalent before use: `mag_zero_norm = mag_zero - 2.5*log10(exptime/90)`.
+Apply in Phase 2 (anchoring + DES shift), Phase 5 (delta_zp), and Test 0 (comparison).
+Exposure times cached in `cache/des_exptime.parquet` from `nsc_dr2.exposure`.
 
 ### Phase 3: Outlier Rejection and Iterative Refinement
 
@@ -170,14 +189,17 @@ The initial solution will be contaminated by:
 - CCD-edge effects and bad columns
 - Non-photometric exposures with rapid transparency variations (clouds)
 
-**Iterative sigma-clipping procedure:**
+**Iterative sigma-clipping procedure (detection-level flagging):**
 1. Compute residuals for each detection: `r_i = m_inst_i + ZP_i - <m_star>` where `<m_star>` is the weighted mean magnitude of the star across all its detections
-2. For each star, compute the chi-squared of its residuals: `chi^2 = sum(r_i^2 / sigma_i^2)`, `dof = N_detections - 1`
-3. Flag stars with chi^2 / dof > 3 (likely variables or artifacts)
-4. Flag individual detections with |residual| > 5*sigma (catastrophic outliers)
-5. Remove flagged detections from the input catalog
-6. Re-solve (Phase 2)
-7. Repeat until convergence (typically 3–5 iterations)
+2. Flag individual outlier detections with |residual| > 5*sigma (catastrophic outliers)
+3. For each star, compute chi-squared of its residuals: `chi^2 = sum(r_i^2 / sigma_i^2)`, `dof = N_detections - 1`
+4. Stars with chi^2/dof > 3 are flagged ONLY if they have < 2 clean detections remaining after step 2.
+   This prevents DES deep field stars from being wrongly flagged as "variable" — their high chi2/dof
+   comes from the detection cap subsample spanning different conditions, not actual variability.
+5. Track flagged detections as `(objectid, expnum, ccdnum)` tuples for detection-level removal
+6. Remove flagged detections (not whole stars) from the input catalog
+7. Re-solve (Phase 2)
+8. Repeat until convergence (typically 3–5 iterations)
 
 **Additional quality cuts after first solve:**
 - Flag exposures where the solved ZP deviates by > 0.3 mag from the nightly median (likely cloudy)
@@ -247,17 +269,37 @@ For every star in the catalog, compute `MAG_DR2 - MAG_UBERCAL` (i.e., the origin
 - **Program boundaries**: Sharp edges in the difference map at the boundaries of different DECam programs indicate that ubercal is correcting program-to-program zero-point offsets.
 - **DES interior**: Inside the DES footprint, `MAG_DR2 - MAG_UBERCAL` should be near zero (since DES FGCM is the anchor for both), confirming that ubercal preserves the DES calibration.
 
-### Test 3: Gaia XP synthetic photometry comparison (external, not used for calibration)
-Transform ubercal magnitudes to the Gaia G band using color transformations (following the procedure in Drlica-Wagner et al. 2022, Figure 4), and compare to Gaia DR3 photometry for bright stars. Map the median offset `G_predicted - G_Gaia` in HEALPix pixels. This replicates the DELVE DR1/DR2 validation diagnostic:
-- In DR2, this map shows a ~10 mmag step at dec = −30°.
-- After ubercal, the step should vanish — the map should be spatially smooth with scatter ≤ 5–7 mmag.
-- This is the most visually compelling validation: a direct apples-to-apples comparison with the published DELVE diagnostic figure, showing the discontinuity removed.
+### Test 4: Gaia DR3 comparison using G_BP/G_RP with DELVE g−r color term
+Compare ubercal magnitudes to Gaia DR3 photometry. For g-band, use Gaia G_BP (closer match to DECam g than Gaia G). For r/i/z bands, use Gaia G_RP (closer match).
+- Uses pre-built Gaia-NSC crossmatch table on Data Lab (`gaia_dr3.x1p5__gaia_source__nsc_dr2__object`)
+- Quality cuts: `phot_g_mean_flux_over_error > 50`, `phot_bp_mean_flux_over_error > 10`
+- **Polynomial (degree 5) color term** — linear is insufficient for Gaia filter mismatch
+- **DELVE g−r color axis** (NOT Gaia BP−RP) — color term should use survey's own colors; falls back to Gaia BP−RP if g−r unavailable
+- Produces 2x2 plot: histogram (after CT only, "RMS = X.X mmag"), color term fit, sky map of residuals, magnitude dependence
+- Sky map shows spatial uniformity of calibration after removing filter-system color term
 
-### Test 4: Stellar locus width vs. position
+### Before/after ubercal comparison (integrated into Tests 4 and 7)
+Tests 4 (Gaia) and 7 (PS1) both overplot a "before ubercal" histogram (using `mag_before_{band}` from Phase 5 catalog) alongside the "after ubercal" histogram. Same color term is applied to both. **PASS criterion: ubercal RMS must be ≤ before-ubercal RMS.** Phase 5 catalog includes `mag_before_{band}` column (original NSC DR2 calibration without ubercal delta_zp correction).
+
+### Test 5: Stellar locus width vs. position
 In color-color space (g−r vs r−i), the main-sequence stellar locus should be tight and position-independent. Measure the locus width (perpendicular scatter) in HEALPix pixels across the sky. Spatial variations in locus width indicate calibration non-uniformity. After ubercal, the locus width should be uniform to within ~5 mmag.
 
-### Test 5: DES boundary continuity
+### Test 6: DES boundary continuity
 Select stars in a narrow strip spanning the DES footprint boundary. Compare the ubercal magnitudes of stars just inside DES (calibrated by FGCM) to stars just outside (calibrated by the ubercal overlap network). There should be no discontinuity — the overlap-based solution should seamlessly connect to the FGCM-anchored region.
+
+### Test 7: PS1 DR2 direct comparison (dec > −30)
+**External comparison against Pan-STARRS 1 DR2** — the definitive PS1 catalog with Schlafly et al. (2012) / Magnier et al. (2020) calibration (~7–12 mmag systematic floor).
+
+- Query PS1 DR2 MeanPSFMag via MAST TAP at `https://mast.stsci.edu/vo-tap/api/v0.1/ps1dr2/` (NOT the REST API at `catalogs.mast.stsci.edu`)
+- Table: `dbo.MeanObjectView`, quality cuts: `QfPerfect > 0.85`, `nDetections > 1`
+- **Must chunk by RA** (2-degree strips) — full region queries get ABORTED after ~10 min by MAST server
+- **Must set `maxrec=500000`** in `submit_job()` — default 100K row limit truncates dense chunks (e.g. DES deep fields)
+- Cross-match with ubercal catalog by position (1 arcsec radius) using astropy SkyCoord
+- Fit and remove linear color term using PS1 g−i color (DECam and PS1 filter systems differ)
+- Compute and map spatial residuals after color term removal
+- PS1 covers **dec > −30 only** — validates the northern half of the DELVE footprint
+- After color term removal, spatial RMS should be ≤ 20 mmag (limited by PS1's own calibration floor)
+- This replaces the earlier LS DR10 comparison (LS DR10 is PS1-calibrated, so going direct is cleaner)
 
 ---
 

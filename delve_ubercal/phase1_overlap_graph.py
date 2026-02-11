@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from delve_ubercal.phase0_ingest import get_test_region_pixels, load_config
+from delve_ubercal.phase0_ingest import get_test_patch_pixels, get_test_region_pixels, load_config
 from delve_ubercal.utils.healpix_utils import get_all_healpix_pixels
 
 
@@ -351,6 +351,10 @@ def main():
         "--test-region", action="store_true",
         help="Limit to test region RA=50-70, Dec=-40 to -25",
     )
+    parser.add_argument(
+        "--test-patch", action="store_true",
+        help="Limit to 10x10 deg test patch RA=50-60, Dec=-35 to -25",
+    )
     parser.add_argument("--config", default=None, help="Path to config.yaml")
     parser.add_argument(
         "--max-pixels", type=int, default=None,
@@ -365,7 +369,10 @@ def main():
     cache_dir = Path(config["data"]["cache_path"])
 
     # Determine which pixels to process
-    if args.test_region:
+    if args.test_patch:
+        pixels = get_test_patch_pixels(nside)
+        print(f"Test patch (10x10 deg): {len(pixels)} HEALPix pixels (nside={nside})", flush=True)
+    elif args.test_region:
         pixels = get_test_region_pixels(nside)
         print(f"Test region: {len(pixels)} HEALPix pixels (nside={nside})", flush=True)
     else:

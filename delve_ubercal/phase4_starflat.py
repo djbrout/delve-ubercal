@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from delve_ubercal.phase0_ingest import get_test_region_pixels, load_config
+from delve_ubercal.phase0_ingest import get_test_patch_pixels, get_test_region_pixels, load_config
 from delve_ubercal.phase2_solve import (
     accumulate_normal_equations,
     build_node_index,
@@ -363,11 +363,11 @@ def run_starflat(band, pixels, config, output_dir, cache_dir, mode="both"):
     des_fgcm_zps = load_des_fgcm_zps(cache_dir, band)
     exposure_mjds = load_exposure_mjds(cache_dir, band)
 
-    # Load Phase 3 anchored solution
-    zp_file = phase3_dir / "zeropoints_anchored.parquet"
+    # Load Phase 3 unanchored solution
+    zp_file = phase3_dir / "zeropoints_unanchored.parquet"
     if not zp_file.exists():
         print("  Phase 3 output not found, using Phase 2...", flush=True)
-        zp_file = output_dir / f"phase2_{band}" / "zeropoints_anchored.parquet"
+        zp_file = output_dir / f"phase2_{band}" / "zeropoints_unanchored.parquet"
 
     zp_df = pd.read_parquet(zp_file)
     zp_dict = dict(zip(
@@ -536,6 +536,10 @@ def main():
         "--test-region", action="store_true",
         help="Limit to test region",
     )
+    parser.add_argument(
+        "--test-patch", action="store_true",
+        help="Limit to 10x10 deg test patch RA=50-60, Dec=-35 to -25",
+    )
     parser.add_argument("--config", default=None, help="Path to config.yaml")
     args = parser.parse_args()
 
@@ -545,7 +549,10 @@ def main():
     output_dir = Path(config["data"]["output_path"])
     cache_dir = Path(config["data"]["cache_path"])
 
-    if args.test_region:
+    if args.test_patch:
+        pixels = get_test_patch_pixels(nside)
+        print(f"Test patch (10x10 deg): {len(pixels)} pixels (nside={nside})", flush=True)
+    elif args.test_region:
         pixels = get_test_region_pixels(nside)
         print(f"Test region: {len(pixels)} pixels (nside={nside})", flush=True)
     else:

@@ -12,8 +12,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from delve_ubercal.phase0_ingest import get_test_region_pixels, load_config
-from delve_ubercal.phase2_solve import build_node_index, load_des_fgcm_zps
+# Extinction coefficients: A_band / E(B-V)
+# DECam: Schlafly & Finkbeiner (2011) Table 6, R_V=3.1
+EXTINCTION_COEFFS = {
+    "g": 3.237, "r": 2.176, "i": 1.595, "z": 1.217,
+}
+
+from delve_ubercal.phase0_ingest import get_test_patch_pixels, get_test_region_pixels, load_config
+from delve_ubercal.phase2_solve import build_node_index, load_des_fgcm_zps, load_nsc_zpterms
 from delve_ubercal.phase3_outlier_rejection import load_exposure_mjds
 from delve_ubercal.phase4_starflat import evaluate_chebyshev_2d, get_epoch
 from delve_ubercal.utils.healpix_utils import get_all_healpix_pixels
@@ -60,7 +66,8 @@ def load_flagged_stars(phase3_dir):
 
 def build_star_catalog(phase0_files, zp_dict, starflat_corrections,
                        flagged_stars, exposure_mjds, node_to_idx,
-                       config, band):
+                       des_fgcm_dict, nsc_zpterm_dict,
+                       config, band, phase3_starflat=None):
     """Build the final ubercalibrated star catalog.
 
     Parameters
@@ -77,6 +84,10 @@ def build_star_catalog(phase0_files, zp_dict, starflat_corrections,
         expnum -> MJD.
     node_to_idx : dict
         Connected node index.
+    des_fgcm_dict : dict
+        (expnum, ccdnum) -> ZP_FGCM for DES CCD-exposures.
+    nsc_zpterm_dict : dict
+        (expnum, ccdnum) -> zpterm from NSC chip table.
     config : dict
         Pipeline config.
     band : str
@@ -90,10 +101,25 @@ def build_star_catalog(phase0_files, zp_dict, starflat_corrections,
         Per-CCD-exposure zero-point table.
     """
     # Accumulate per-star statistics
-    star_accum = {}  # objectid -> {sum_w, sum_wm, sum_wr2, n_det, ra, dec}
+    # sum_wm_before: weighted sum of mag_aper4 (original NSC DR2 calibration)
+    # sum_wm: weighted sum of m_cal (ubercal-corrected magnitude)
+    star_accum = {}  # objectid -> {sum_w, sum_wm, sum_wm_before, n_det, ra, dec}
 
     median_zp = np.median([zp for zp in zp_dict.values() if zp > 1.0])
     min_valid_zp = median_zp - 5.0
+
+    # Estimate MAGZERO from DES data: median(ZP_FGCM - zpterm) over DES CCD-exposures.
+    # m_inst has MAGZERO baked in, so ZP_solved ≈ ZP_true - MAGZERO + MAGZERO = ZP_FGCM.
+    # For non-DES, the "current" NSC total ZP is (zpterm + MAGZERO).
+    # delta_zp_nonDES = ZP_solved - (zpterm + MAGZERO) captures the ubercal correction.
+    _magzero_vals = []
+    for (e, c), fgcm in des_fgcm_dict.items():
+        if 25.0 < fgcm < 35.0:
+            zpt = nsc_zpterm_dict.get((e, c))
+            if zpt is not None and abs(zpt) < 2.0:
+                _magzero_vals.append(fgcm - zpt)
+    magzero_offset = float(np.median(_magzero_vals)) if _magzero_vals else 31.45
+    print(f"    MAGZERO offset (from DES): {magzero_offset:.4f}", flush=True)
 
     n_files = 0
     n_dets_total = 0
@@ -138,16 +164,46 @@ def build_star_catalog(phase0_files, zp_dict, starflat_corrections,
                         [row["x"]], [row["y"]], starflat_corrections[key]
                     )[0]
 
-        # Calibrated magnitude
-        m_cal = df["m_inst"].values + zps - delta_sf
+        # Calibrated magnitude: m_inst + ZP_solved - MAGZERO_offset
+        # The solver ensures m_inst + ZP_solved is consistent across all
+        # detections of the same star (this is the overlap constraint).
+        # MAGZERO_offset removes the MAGZERO that's baked into m_inst,
+        # putting magnitudes on the correct absolute scale.
+        # This formula is used for ALL CCD-exposures (DES and non-DES),
+        # ensuring internal consistency.
+        expnums = df["expnum"].values
+        ccdnums = df["ccdnum"].values
+        zpterms = np.array([
+            nsc_zpterm_dict.get((e, c), 0.0)
+            for e, c in zip(expnums, ccdnums)
+        ])
+        mag_aper4 = df["m_inst"].values + zpterms
+        m_cal = df["m_inst"].values + zps - magzero_offset - delta_sf
         w = 1.0 / (df["m_err"].values ** 2)
+
+        # Star-flat-only calibration: zpterm + Phase 3 constant star flat
+        # This keeps the original zpterm for the gray/large-scale component
+        # and applies only the per-CCD-per-epoch correction from overlaps.
+        m_starflat = mag_aper4.copy()
+        if phase3_starflat is not None:
+            if "mjd" not in df.columns:
+                df["mjd"] = df["expnum"].map(exposure_mjds)
+            for i, (_, row) in enumerate(df.iterrows()):
+                mjd = row.get("mjd", np.nan)
+                if np.isnan(mjd):
+                    continue
+                epoch = get_epoch(mjd, int(row["ccdnum"]), config)
+                sf_val = phase3_starflat.get((int(row["ccdnum"]), epoch), 0.0)
+                m_starflat[i] += sf_val
 
         # Accumulate per star
         for j, (_, row) in enumerate(df.iterrows()):
             oid = row["objectid"]
             if oid not in star_accum:
                 star_accum[oid] = {
-                    "sum_w": 0.0, "sum_wm": 0.0, "n_det": 0,
+                    "sum_w": 0.0, "sum_wm": 0.0, "sum_wm_before": 0.0,
+                    "sum_wm_sf": 0.0,
+                    "n_det": 0,
                     "ra": row.get("ra", np.nan),
                     "dec": row.get("dec", np.nan),
                     "m_vals": [],
@@ -156,6 +212,8 @@ def build_star_catalog(phase0_files, zp_dict, starflat_corrections,
             sa = star_accum[oid]
             sa["sum_w"] += w[j]
             sa["sum_wm"] += w[j] * m_cal[j]
+            sa["sum_wm_before"] += w[j] * mag_aper4[j]
+            sa["sum_wm_sf"] += w[j] * m_starflat[j]
             sa["n_det"] += 1
             sa["m_vals"].append(m_cal[j])
             sa["w_vals"].append(w[j])
@@ -171,6 +229,8 @@ def build_star_catalog(phase0_files, zp_dict, starflat_corrections,
         if sa["n_det"] < 1:
             continue
         mag_mean = sa["sum_wm"] / sa["sum_w"]
+        mag_before = sa["sum_wm_before"] / sa["sum_w"]
+        mag_starflat = sa["sum_wm_sf"] / sa["sum_w"]
         mag_err = 1.0 / np.sqrt(sa["sum_w"])
 
         # Chi2 for variability
@@ -184,12 +244,37 @@ def build_star_catalog(phase0_files, zp_dict, starflat_corrections,
             "ra": sa["ra"],
             "dec": sa["dec"],
             f"mag_ubercal_{band}": mag_mean,
+            f"mag_starflat_{band}": mag_starflat,
+            f"mag_before_{band}": mag_before,
             f"magerr_ubercal_{band}": mag_err,
             f"nobs_{band}": sa["n_det"],
             f"chi2_{band}": chi2 / dof,
         })
 
     star_cat = pd.DataFrame(records)
+
+    # Add SFD E(B-V) and dereddened magnitudes
+    if len(star_cat) > 0 and band in EXTINCTION_COEFFS:
+        try:
+            from dustmaps.config import config as dm_config
+            dm_config["data_dir"] = str(Path(config["data"]["cache_path"]) / "dustmaps")
+            from dustmaps.sfd import SFDQuery
+            from astropy.coordinates import SkyCoord
+            import astropy.units as u
+
+            sfd = SFDQuery()
+            coords = SkyCoord(
+                ra=star_cat["ra"].values * u.deg,
+                dec=star_cat["dec"].values * u.deg,
+            )
+            ebv = np.asarray(sfd(coords), dtype=float)
+            R = EXTINCTION_COEFFS[band]
+            star_cat["ebv_sfd"] = ebv
+            star_cat[f"mag_dered_{band}"] = star_cat[f"mag_ubercal_{band}"] - R * ebv
+            print(f"    SFD E(B-V): median={np.median(ebv):.4f}, "
+                  f"A_{band} median={np.median(R * ebv):.3f} mag", flush=True)
+        except Exception as exc:
+            print(f"    WARNING: SFD dereddening failed: {exc}", flush=True)
 
     # Build ZP table
     zp_records = []
@@ -244,16 +329,34 @@ def run_catalog(band, pixels, config, output_dir, cache_dir):
     node_to_idx, idx_to_node = build_node_index(
         phase1_dir / "connected_nodes.parquet"
     )
-    zp_dict = load_zp_solution(phase3_dir, phase2_dir, mode="anchored")
+    zp_dict = load_zp_solution(phase3_dir, phase2_dir, mode="unanchored")
     print(f"  ZP solutions: {len(zp_dict):,}", flush=True)
 
     starflat_corrections = load_starflat_corrections(phase4_dir)
     print(f"  Star flat groups: {len(starflat_corrections)}", flush=True)
 
+    # Load Phase 3 constant star flat (per-CCD-per-epoch)
+    phase3_sf_file = phase3_dir / "star_flat.parquet"
+    phase3_starflat = None
+    if phase3_sf_file.exists():
+        sf_df = pd.read_parquet(phase3_sf_file)
+        phase3_starflat = {
+            (int(r.ccdnum), int(r.epoch_idx)): r.flat_correction
+            for _, r in sf_df.iterrows()
+        }
+        print(f"  Phase 3 star flat: {len(phase3_starflat)} (CCD, epoch) entries",
+              flush=True)
+
     flagged_stars = load_flagged_stars(phase3_dir)
     print(f"  Flagged stars: {len(flagged_stars):,}", flush=True)
 
     exposure_mjds = load_exposure_mjds(cache_dir, band)
+
+    # Load DES FGCM and NSC zpterms for magnitude convention fix
+    des_fgcm_dict = load_des_fgcm_zps(cache_dir, band)
+    print(f"  DES FGCM ZPs: {len(des_fgcm_dict):,}", flush=True)
+    nsc_zpterm_dict = load_nsc_zpterms(cache_dir, band)
+    print(f"  NSC zpterms: {len(nsc_zpterm_dict):,}", flush=True)
 
     # Phase 0 files (have x, y, ra, dec)
     phase0_files = sorted(phase0_dir.glob(f"detections_nside{nside}_pixel*.parquet"))
@@ -266,7 +369,8 @@ def run_catalog(band, pixels, config, output_dir, cache_dir):
     t0 = time.time()
     star_cat, zp_table = build_star_catalog(
         phase0_files, zp_dict, starflat_corrections, flagged_stars,
-        exposure_mjds, node_to_idx, config, band
+        exposure_mjds, node_to_idx, des_fgcm_dict, nsc_zpterm_dict,
+        config, band, phase3_starflat=phase3_starflat
     )
     cat_time = time.time() - t0
     print(f"  Catalog built in {cat_time:.1f}s", flush=True)
@@ -282,8 +386,11 @@ def run_catalog(band, pixels, config, output_dir, cache_dir):
 
     # Diagnostics
     mag_col = f"mag_ubercal_{band}"
+    mag_before_col = f"mag_before_{band}"
     nobs_col = f"nobs_{band}"
 
+    # Median correction: ubercal - before
+    delta_mag = star_cat[mag_col] - star_cat[mag_before_col]
     print(f"\n  {'=' * 55}", flush=True)
     print(f"  Phase 5 Catalog Summary — {band}-band", flush=True)
     print(f"  {'=' * 55}", flush=True)
@@ -292,6 +399,8 @@ def run_catalog(band, pixels, config, output_dir, cache_dir):
     print(f"    Mag std:           {star_cat[mag_col].std():.3f}", flush=True)
     print(f"    Mag range:         [{star_cat[mag_col].min():.2f}, "
           f"{star_cat[mag_col].max():.2f}]", flush=True)
+    print(f"    Ubercal correction median: {delta_mag.median()*1000:.1f} mmag", flush=True)
+    print(f"    Ubercal correction RMS:    {(delta_mag**2).mean()**0.5*1000:.1f} mmag", flush=True)
     print(f"    Nobs median:       {star_cat[nobs_col].median():.0f}", flush=True)
     print(f"    Nobs max:          {star_cat[nobs_col].max()}", flush=True)
     print(f"    ZP table entries:  {len(zp_table):,}", flush=True)
@@ -303,7 +412,7 @@ def run_catalog(band, pixels, config, output_dir, cache_dir):
     mag_max = star_cat[mag_col].max()
     print(f"    NaN magnitudes:    {n_nan}", flush=True)
     print(f"    Inf magnitudes:    {n_inf}", flush=True)
-    print(f"    Mag physical:      {15 < mag_min and mag_max < 55}", flush=True)
+    print(f"    Mag physical:      {10 < mag_min and mag_max < 25}", flush=True)
     print(f"  {'=' * 55}", flush=True)
 
     return star_cat, zp_table
@@ -318,6 +427,10 @@ def main():
         "--test-region", action="store_true",
         help="Limit to test region",
     )
+    parser.add_argument(
+        "--test-patch", action="store_true",
+        help="Limit to 10x10 deg test patch RA=50-60, Dec=-35 to -25",
+    )
     parser.add_argument("--config", default=None, help="Path to config.yaml")
     args = parser.parse_args()
 
@@ -327,7 +440,10 @@ def main():
     output_dir = Path(config["data"]["output_path"])
     cache_dir = Path(config["data"]["cache_path"])
 
-    if args.test_region:
+    if args.test_patch:
+        pixels = get_test_patch_pixels(nside)
+        print(f"Test patch (10x10 deg): {len(pixels)} pixels (nside={nside})", flush=True)
+    elif args.test_region:
         pixels = get_test_region_pixels(nside)
         print(f"Test region: {len(pixels)} pixels (nside={nside})", flush=True)
     else:
